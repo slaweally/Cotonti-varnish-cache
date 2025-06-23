@@ -1,0 +1,232 @@
+# Example Varnish Configuration for Cotonti
+# This is a basic VCL configuration for Varnish 6.0+ to work with Cotonti Varnish plugin
+# Save this file as /etc/varnish/default.vcl and restart Varnish
+
+vcl 4.1;
+
+# Default backend definition - Your web server
+# This should point to your web server (Apache, Nginx, etc.)
+backend default {
+    .host = "127.0.0.1";    # Your web server IP (usually localhost/127.0.0.1)
+    .port = "8080";         # Your web server port (usually 8080 when Varnish is on 80)
+    .connect_timeout = 600s;
+    .first_byte_timeout = 600s;
+    .between_bytes_timeout = 600s;
+}
+
+# ACL for purge requests - Who can purge the cache
+# Add your server's IP addresses here for security
+acl purge {
+    "localhost";
+    "127.0.0.1";
+    # Add your server's public IP here if needed
+    # "123.45.67.89";
+}
+
+# List of excluded GET parameters that will bypass the cache
+# These should match the 'excluded_params' setting in the plugin
+sub excluded_params {
+    # Default excluded parameters
+    if (req.url ~ "[?&](noCache|__SID)") {
+        return true;
+    }
+    return false;
+}
+
+sub vcl_recv {
+    # Handle PURGE requests - Only allowed from trusted IPs
+    if (req.method == "PURGE") {
+        if (!client.ip ~ purge) {
+            return(synth(405, "This IP is not allowed to send PURGE requests."));
+        }
+        return (purge);
+    }
+    
+    # Handle BAN requests for tag-based cache invalidation
+    if (req.method == "BAN") {
+        if (!client.ip ~ purge) {
+            return(synth(405, "This IP is not allowed to send BAN requests."));
+        }
+        
+        # Ban using cache tags
+        if (req.http.X-Cache-Tags && req.http.X-Varnish-Ban-Tags) {
+            ban("obj.http.X-Cache-Tags ~ " + req.http.X-Cache-Tags);
+            return(synth(200, "Ban added for tag: " + req.http.X-Cache-Tags));
+        }
+        
+        return(synth(400, "Bad BAN request"));
+    }
+    
+    # Skip cache for POST requests - Forms and other data submissions
+    if (req.method == "POST") {
+        return(pass);
+    }
+    
+    # Skip cache for logged-in users - Check for Cotonti session cookies
+    if (req.http.Cookie ~ "PHPSESSID=" || req.http.Cookie ~ "sid=") {
+        return(pass);
+    }
+    
+    # Skip cache if X-Varnish-Cache header is set to BYPASS
+    # This header is set by the Cotonti Varnish plugin
+    if (req.http.X-Varnish-Cache == "BYPASS") {
+        return(pass);
+    }
+    
+    # Skip cache for excluded parameters
+    if (excluded_params()) {
+        return(pass);
+    }
+    
+    # Remove cookies for static files - Improves cache hit rate
+    if (req.url ~ "\.(jpg|jpeg|gif|png|ico|css|js|svg|woff|woff2|ttf|eot)(\?.*)?$") {
+        unset req.http.Cookie;
+        return(hash);
+    }
+    
+    # Remove all cookies except for those needed by Cotonti
+    if (req.http.Cookie) {
+        # Keep only the session cookie if present
+        if (req.http.Cookie ~ "sid=") {
+            set req.http.Cookie = "sid=" + regsub(req.http.Cookie, ".*sid=([^;]+).*", "\1");
+        } else {
+            unset req.http.Cookie;
+        }
+    }
+    
+    # Normalize the Accept-Encoding header - Improves cache hit rate
+    if (req.http.Accept-Encoding) {
+        if (req.http.Accept-Encoding ~ "gzip") {
+            set req.http.Accept-Encoding = "gzip";
+        } else if (req.http.Accept-Encoding ~ "deflate") {
+            set req.http.Accept-Encoding = "deflate";
+        } else {
+            unset req.http.Accept-Encoding;
+        }
+    }
+    
+    # Cache the request by default
+    return(hash);
+}
+
+sub vcl_backend_response {
+    # Set TTL based on Cache-Control header
+    if (beresp.http.Cache-Control ~ "max-age=") {
+        set beresp.ttl = std.duration(regsub(beresp.http.Cache-Control, ".*max-age=([0-9]+).*", "\1s"), 604800s);
+    } else {
+        # Default TTL - 7 days (604800s)
+        set beresp.ttl = 604800s;
+    }
+    
+    # Don't cache responses with Set-Cookie header - Usually for logged-in users
+    if (beresp.http.Set-Cookie) {
+        set beresp.uncacheable = true;
+        return(deliver);
+    }
+    
+    # Don't cache if X-Varnish-Cache header is set to BYPASS
+    if (beresp.http.X-Varnish-Cache == "BYPASS") {
+        set beresp.uncacheable = true;
+        return(deliver);
+    }
+    
+    # Cache static files for longer - 30 days
+    if (bereq.url ~ "\.(jpg|jpeg|gif|png|ico|css|js|svg|woff|woff2|ttf|eot)(\?.*)?$") {
+        set beresp.ttl = 30d;
+    }
+    
+    # Enable gzip compression for text-based content
+    if (beresp.http.content-type ~ "text/html" || 
+        beresp.http.content-type ~ "text/css" || 
+        beresp.http.content-type ~ "text/javascript" || 
+        beresp.http.content-type ~ "application/javascript" || 
+        beresp.http.content-type ~ "application/json") {
+        set beresp.do_gzip = true;
+    }
+    
+    # Keep the X-Cache-Tags header for ban operations
+    if (beresp.http.X-Cache-Tags) {
+        set beresp.http.X-Cache-Tags = beresp.http.X-Cache-Tags;
+    }
+    
+    return(deliver);
+}
+
+sub vcl_deliver {
+    # Add debug info in headers - Useful for troubleshooting
+    if (obj.hits > 0) {
+        set resp.http.X-Cache = "HIT";
+        set resp.http.X-Cache-Hits = obj.hits;
+    } else {
+        set resp.http.X-Cache = "MISS";
+    }
+    
+    # Remove Varnish internal headers in production
+    # Comment these lines during debugging
+    unset resp.http.Via;
+    unset resp.http.X-Varnish;
+    unset resp.http.X-Varnish-Cache;
+    unset resp.http.Server;
+    
+    # Keep X-Cache-Tags header for debugging
+    # Uncomment to remove in production
+    # unset resp.http.X-Cache-Tags;
+    
+    return(deliver);
+}
+
+sub vcl_hit {
+    return(deliver);
+}
+
+sub vcl_miss {
+    return(fetch);
+}
+
+sub vcl_pass {
+    return(fetch);
+}
+
+sub vcl_pipe {
+    return(pipe);
+}
+
+sub vcl_synth {
+    set resp.http.Content-Type = "text/html; charset=utf-8";
+    set resp.http.Retry-After = "5";
+    synthetic( {"<!DOCTYPE html>
+<html>
+  <head>
+    <title>"} + resp.status + " " + resp.reason + {"</title>
+  </head>
+  <body>
+    <h1>Error "} + resp.status + " " + resp.reason + {"</h1>
+    <p>"} + resp.reason + {"</p>
+    <h3>Guru Meditation:</h3>
+    <p>XID: "} + req.xid + {"</p>
+  </body>
+</html>
+"} );
+    return(deliver);
+}
+
+sub vcl_purge {
+    return(synth(200, "Purged"));
+}
+
+sub vcl_hash {
+    hash_data(req.url);
+    
+    if (req.http.host) {
+        hash_data(req.http.host);
+    } else {
+        hash_data(server.ip);
+    }
+    
+    # If there is a query string, include it in the hash
+    if (req.url ~ "\?") {
+        hash_data(regsub(req.url, "^[^?]*\??", ""));
+    }
+    
+    return(lookup);
+} 
